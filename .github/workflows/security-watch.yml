@@ -1,0 +1,115 @@
+# Place this file at: .github/workflows/security-watch.yml
+name: Security Watch
+
+on:
+  schedule:
+    # GitHub cron runs in UTC. Lagos (WAT) is UTC+1 all year, so:
+    #   08:00 UTC = 9:00 AM Lagos   |   13:00 UTC = 2:00 PM Lagos   -> full inventory scan
+    - cron: "0 8,13 * * *"
+    #   18:00 UTC = 7:00 PM Lagos                                  -> cve.now NEWS digest only
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = inventory scan, news = cve.now high-severity digest"
+        type: choice
+        options: [full, news]
+        default: full
+      dry_run:
+        description: "Dry run (print the report in the log, send nothing, save nothing)"
+        type: boolean
+        default: false
+      baseline:
+        description: "Force a silent baseline (re-records everything as already known)"
+        type: boolean
+        default: false
+
+# Needed to push the memory file to the security-state branch
+permissions:
+  contents: write
+
+# Never let two runs overlap (they share one memory file)
+concurrency:
+  group: security-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      STATE_PATH: state/state.json
+      DRY_RUN: ${{ inputs.dry_run }}
+      FORCE_BASELINE: ${{ inputs.baseline }}
+
+    steps:
+      - name: Check out the script
+        uses: actions/checkout@v4
+
+      # The "already reported" memory lives on its own branch so main stays clean.
+      # First ever run: the branch doesn't exist yet, so we create it.
+      - name: Load memory (security-state branch)
+        run: |
+          REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$REMOTE" security-state >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch security-state "$REMOTE" state
+            echo "Loaded existing memory."
+          else
+            mkdir state
+            git -C state init -q
+            git -C state checkout -q --orphan security-state
+            git -C state remote add origin "$REMOTE"
+            echo "No memory yet: starting fresh (first run will be the silent baseline)."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Security Watch
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          # The 7 PM schedule is the news run; manual runs use the chosen mode
+          MODE="full"
+          if [ "$SCHEDULE" = "0 18 * * *" ]; then MODE="news"; fi
+          if [ -n "$INPUT_MODE" ]; then MODE="$INPUT_MODE"; fi
+          ARGS="--mode $MODE"
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "$FORCE_BASELINE" = "true" ]; then ARGS="$ARGS --baseline"; fi
+          python watch.py $ARGS
+
+      # Only after a successful run (and Slack delivery) do we save the memory
+      - name: Save memory
+        if: ${{ success() && inputs.dry_run != true }}
+        run: |
+          cd state
+          git config user.name "security-watch-bot"
+          git config user.email "security-watch-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Memory unchanged."
+          else
+            git commit -q -m "state: $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push -q origin security-state
+            echo "Memory saved."
+          fi
+
+      # Silence must never mean "all clear": if the run breaks, tell Slack
+      - name: Alert Slack if the run failed
+        if: ${{ failure() }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"⚠️ *Security Watch failed to run.* No report was produced this time. Check the log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+              "$SLACK_WEBHOOK_URL"
+          fi
